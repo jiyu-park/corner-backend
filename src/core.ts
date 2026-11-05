@@ -239,4 +239,32 @@ export async function billingFor(memberId: number, date: string) {
   };
 }
 
+/**
+ * 예약하기 전에 "얼마나 차감되고, 한도를 넘으면 얼마가 청구되는지"를 계산해서 보여 준다. (저장하지 않음)
+ * allocateUsage와 같은 규칙: 개인 시간부터 쓰고, 모자라면 다음 지갑, 모두 모자라면 초과 과금.
+ */
+export async function previewUsage(userId: number, date: string, minutes: number) {
+  const wallets = await getWallets(userId, date);
+  if (wallets.length === 0) return { has_membership: false as const, wallets: [] as any[], parts: [] as any[], overage_minutes: 0, overage_amount: 0 };
+  let need = minutes;
+  const parts: { member_name: string; member_type: string; minutes: number; remaining_before: number; remaining_after: number }[] = [];
+  for (const w of wallets) {
+    if (need <= 0) break;
+    const avail = Math.max(0, w.remaining_minutes);
+    const take = Math.min(avail, need);
+    if (take > 0) {
+      parts.push({ member_name: w.member_name, member_type: w.member_type, minutes: take, remaining_before: w.remaining_minutes, remaining_after: w.remaining_minutes - take });
+      need -= take;
+    }
+  }
+  const overage = Math.max(0, need);
+  return {
+    has_membership: true as const,
+    wallets: wallets.map((w) => ({ member_name: w.member_name, member_type: w.member_type, plan_name: w.plan_name, remaining_minutes: w.remaining_minutes, cycle_end: w.cycle_end })),
+    parts,
+    overage_minutes: overage,
+    overage_amount: Math.round((overage / 60) * OVERAGE_PER_HOUR),
+  };
+}
+
 export { addDays };

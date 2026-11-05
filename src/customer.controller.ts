@@ -13,12 +13,13 @@ import {
 } from '@nestjs/common';
 import { AuthUser, CurrentUser, Roles } from './auth';
 import { q, query, tx } from './db';
-import { addDays, cycleFor, isHM, isYMD, minutesBetween, nowKST } from './dates';
+import { addDays, cycleFor, isHM, isYMD, minutesBetween, monthRange, nowKST } from './dates';
 import {
   allocateUsage,
   anchorFor,
   applyPenalty,
   getWallets,
+  previewUsage,
   releaseUsage,
   runner,
   OVERAGE_PER_HOUR,
@@ -184,6 +185,46 @@ export class CustomerController {
   }
 
   // ───────── 예약 ─────────
+  // 한 달 달력용: 그 달의 예약(취소 제외)을 모든 회의실에 대해 돌려준다. 누가 예약했는지는 숨기고 "내 예약"인지만 알려 준다.
+  @Roles('customer')
+  @Get('reservations/calendar')
+  async calendar(@CurrentUser() user: AuthUser, @Query('month') month?: string) {
+    const mo = month && /^\d{4}-\d{2}$/.test(month) ? month : nowKST().date.slice(0, 7);
+    const { start, end } = monthRange(mo);
+    const rows = await query(
+      `select r.id, r.reserved_date, to_char(r.start_time,'HH24:MI') as start_time, to_char(r.end_time,'HH24:MI') as end_time,
+              r.meeting_room_id, mr.name as room_name, r.status, (r.user_id = $3) as mine
+         from reservations r join meeting_rooms mr on mr.id = r.meeting_room_id
+        where r.reserved_date between $1 and $2 and r.status <> 'cancelled'
+        order by r.reserved_date, r.start_time`,
+      [start, end, user.id],
+    );
+    return { month: mo, reservations: rows };
+  }
+
+  // 예약 전 미리 보기: 차감 시간, 남는 시간, 한도를 넘을 때의 청구 금액. 저장하지 않는다.
+  @Roles('customer')
+  @Post('reservations/preview')
+  async preview(
+    @CurrentUser() user: AuthUser,
+    @Body() body: { reserved_date?: string; start_time?: string; end_time?: string; meeting_room_id?: number; people_count?: number },
+  ) {
+    if (!isYMD(body.reserved_date) || !isHM(body.start_time) || !isHM(body.end_time)) {
+      return { ok: false, reason: '날짜와 시각을 확인해 주세요.' };
+    }
+    const minutes = minutesBetween(hm(body.start_time), hm(body.end_time));
+    if (minutes <= 0) return { ok: false, reason: '끝나는 시각은 시작 시각보다 늦어야 해요.' };
+    let capacity_warning: string | null = null;
+    if (body.meeting_room_id && body.people_count) {
+      const [room] = await query('select name, max_people from meeting_rooms where id = $1', [body.meeting_room_id]);
+      if (room && Number(body.people_count) > room.max_people) {
+        capacity_warning = `${room.name}은(는) 최대 ${room.max_people}명까지 이용할 수 있어요.`;
+      }
+    }
+    const p = await previewUsage(user.id, body.reserved_date, minutes);
+    return { ok: true, minutes, overage_per_hour: OVERAGE_PER_HOUR, capacity_warning, ...p };
+  }
+
   @Roles('customer')
   @Get('reservations/mine')
   async myReservations(@CurrentUser() user: AuthUser) {
