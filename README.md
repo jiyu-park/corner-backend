@@ -54,6 +54,17 @@ psql "$DATABASE_URL" -f db/rule_tests.sql            # 모두 rollback, 데이�
 node --env-file=.env db/api_smoke_test.mjs           # 서버가 떠 있어야 함. 테스트 데이터가 남으니 아래로 정리
 ```
 
+## 가상 데이터 (발표·확인용)
+
+실제 사람과 회사가 아닌 가상 데이터입니다. 이메일이 `@demo.corner.test`로 끝나고 회사 이름에 `(가상)`이 붙습니다.
+
+```bash
+node --env-file=.env db/demo_data.mjs                 # 넣기 (사람 8명, 멤버 7개, 예약 30건)
+psql "$DATABASE_URL" -f db/demo_data_cleanup.sql      # 지우기 (체험용 계정과 관리자는 그대로)
+```
+
+한도 초과 과금, 노쇼 0%·50% 차감, 직원 정정, 개인 시간을 먼저 쓰는 분할 차감, 회사 이동 사례가 들어 있습니다.
+
 ## 주요 API
 
 | 구분 | 경로 |
