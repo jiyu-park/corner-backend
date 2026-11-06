@@ -10,6 +10,9 @@ export const runner = (c?: PoolClient): Runner =>
 
 export const OVERAGE_PER_HOUR = 15000;
 
+/** 밖으로 내보낼 때는 DB 안의 멤버 id(연번)를 뺀다. */
+export const pubWallet = ({ member_id, ...w }: Wallet) => w;
+
 /**
  * 주기의 기준일(가입일). 멤버십이 끊기지 않고 이어지는 묶음의 첫 시작일.
  * (멤버십을 올려서 줄이 나뉘어도 같은 주기로 본다. 결정 14, 15)

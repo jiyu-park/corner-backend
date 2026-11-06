@@ -17,6 +17,17 @@ npm run seed:admin       # 처음 관리자 계정 1개
 npm run start:dev        # http://localhost:4000
 ```
 
+이미 운영 중인 DB는 `db/schema.sql`을 다시 실행하지 말고, 변환용 SQL을 한 번 실행합니다. (여러 번 실행해도 안전)
+
+```bash
+psql "$DATABASE_URL" -f db/migrations/001_public_id_and_role_enum.sql   # role을 enum으로, public_id 추가
+```
+
+## 번호(id) 쓰는 방식
+
+`users`, `members`, `reservations`는 DB 안에서 표를 잇는 연번 `id`와, 밖에 내보내는 무작위 `public_id`(UUID)를 따로 갖습니다.
+화면, API 응답과 주소, 로그인 토큰에는 `public_id`만 나옵니다. (응답의 `id`가 곧 `public_id`) 연번 id는 밖으로 나가지 않습니다.
+
 ## 설정값 (.env, GitHub에 올리지 않습니다)
 
 | 이름 | 설명 |
@@ -41,7 +52,7 @@ npm run start:dev        # http://localhost:4000
 
 | DB가 막음 (`db/schema.sql`) | 백엔드가 막음 |
 |---|---|
-| 이메일 중복, 허용 값(역할·상태) | 정원 초과(예약·인원 수정) |
+| 이메일 중복, 허용 값(역할은 enum 타입, 상태는 check) | 정원 초과(예약·인원 수정) |
 | 같은 회의실 같은 시간 겹침(취소 제외) | 멤버십 기간 밖 예약 |
 | 끝 > 시작, 08:00~22:00, 30분 단위 | 노쇼·늦은 취소 차감, 초과 시간 과금 |
 | 같은 자리 기간 겹침, 한 사람 동시 두 곳 소속, 한 멤버 동시 두 멤버십 | 퇴사·해지 시 앞으로 예약 자동 취소 |

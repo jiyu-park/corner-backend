@@ -1,6 +1,6 @@
 import { BadRequestException, Body, Controller, Get, Post, UnauthorizedException, ForbiddenException } from '@nestjs/common';
 import * as bcrypt from 'bcryptjs';
-import { AllowTempPassword, AuthUser, CurrentUser, Public, signToken } from './auth';
+import { AllowTempPassword, AuthUser, CurrentUser, Public, signToken, toPublicUser } from './auth';
 import { query, q, tx } from './db';
 import { nowKST } from './dates';
 
@@ -37,14 +37,14 @@ export class AuthController {
       const [u] = await q(
         c,
         `insert into users (email, password_hash, name, role) values ($1,$2,$3,'customer')
-         returning id, email, name, role, must_change_password`,
+         returning id, public_id, email, name, role, must_change_password`,
         [email, hash, name],
       );
       const [m] = await q(c, `insert into members (type, name) values ('individual', $1) returning id`, [name]);
       await q(c, 'insert into member_users (user_id, member_id, start_date) values ($1,$2,$3)', [u.id, m.id, today]);
       return u;
     });
-    return { token: signToken(user.id), user };
+    return { token: signToken(user.public_id), user: toPublicUser(user) };
   }
 
   // app: 'web'이면 고객만, 'admin'이면 직원·관리자만 로그인할 수 있다.
@@ -67,8 +67,8 @@ export class AuthController {
       throw new ForbiddenException('고객 전용 화면이에요. 직원은 어드민을 이용해 주세요.');
     }
     return {
-      token: signToken(u.id),
-      user: { id: u.id, email: u.email, name: u.name, role: u.role, must_change_password: u.must_change_password },
+      token: signToken(u.public_id),
+      user: toPublicUser(u),
     };
   }
 

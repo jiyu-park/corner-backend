@@ -10,10 +10,12 @@ import {
 import { Reflector } from '@nestjs/core';
 import * as jwt from 'jsonwebtoken';
 import { query } from './db';
+import { isUUID } from './ids';
 
 export type Role = 'customer' | 'staff' | 'admin';
 export interface AuthUser {
-  id: number;
+  id: number; // DB 안에서만 쓴다. 밖으로 내보내지 않는다.
+  public_id: string; // 밖(화면, API, 토큰)에 쓰는 번호
   email: string;
   name: string;
   role: Role;
@@ -26,7 +28,16 @@ const secret = () => {
   return s;
 };
 
-export const signToken = (userId: number) => jwt.sign({ sub: userId }, secret(), { expiresIn: '12h' });
+export const signToken = (publicId: string) => jwt.sign({ sub: publicId }, secret(), { expiresIn: '12h' });
+
+/** 밖으로 내보내는 사용자 모양: id 자리에 public_id를 넣는다. */
+export const toPublicUser = (u: Pick<AuthUser, 'public_id' | 'email' | 'name' | 'role' | 'must_change_password'>) => ({
+  id: u.public_id,
+  email: u.email,
+  name: u.name,
+  role: u.role,
+  must_change_password: u.must_change_password,
+});
 
 export const Roles = (...roles: Role[]) => SetMetadata('roles', roles);
 export const AllowTempPassword = () => SetMetadata('allowTempPassword', true);
@@ -56,16 +67,18 @@ export class AuthGuard implements CanActivate {
     const token = header.startsWith('Bearer ') ? header.slice(7) : '';
     if (!token) throw new UnauthorizedException('로그인이 필요해요.');
 
-    let userId: number;
+    let publicId: string;
     try {
-      userId = Number((jwt.verify(token, secret()) as any).sub);
+      publicId = String((jwt.verify(token, secret()) as any).sub);
     } catch {
       throw new UnauthorizedException('로그인이 만료되었어요. 다시 로그인해 주세요.');
     }
+    // 예전 방식(숫자) 토큰은 UUID 모양이 아니라서 만료로 처리한다.
+    if (!isUUID(publicId)) throw new UnauthorizedException('로그인이 만료되었어요. 다시 로그인해 주세요.');
 
     const rows = await query<any>(
-      'select id, email, name, role, is_active, must_change_password from users where id = $1',
-      [userId],
+      'select id, public_id, email, name, role, is_active, must_change_password from users where public_id = $1',
+      [publicId],
     );
     const u = rows[0];
     if (!u || !u.is_active) throw new UnauthorizedException('사용할 수 없는 계정이에요.');
@@ -83,6 +96,7 @@ export class AuthGuard implements CanActivate {
 
     req.user = {
       id: u.id,
+      public_id: u.public_id,
       email: u.email,
       name: u.name,
       role: u.role,

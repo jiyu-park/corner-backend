@@ -11,7 +11,8 @@ import {
   Post,
   Query,
 } from '@nestjs/common';
-import { AuthUser, CurrentUser, Roles } from './auth';
+import { AuthUser, CurrentUser, Roles, toPublicUser } from './auth';
+import { uuidPipe } from './ids';
 import { q, query, tx } from './db';
 import { addDays, cycleFor, isHM, isYMD, minutesBetween, monthRange, nowKST } from './dates';
 import {
@@ -22,6 +23,7 @@ import {
   previewUsage,
   releaseUsage,
   runner,
+  pubWallet,
   OVERAGE_PER_HOUR,
 } from './core';
 
@@ -45,7 +47,7 @@ export class CustomerController {
   async roomDay(@Param('id', ParseIntPipe) id: number, @Query('date') date?: string) {
     const d = date && isYMD(date) ? date : nowKST().date;
     const rows = await query(
-      `select id, to_char(start_time, 'HH24:MI') as start_time, to_char(end_time, 'HH24:MI') as end_time, status
+      `select public_id as id, to_char(start_time, 'HH24:MI') as start_time, to_char(end_time, 'HH24:MI') as end_time, status
          from reservations
         where meeting_room_id = $1 and reserved_date = $2 and status <> 'cancelled'
         order by start_time`,
@@ -61,7 +63,7 @@ export class CustomerController {
     const today = nowKST().date;
     const R = runner();
     const [member] = await R(
-      `select mb.id, mb.type, mb.name, mu.start_date as joined_on
+      `select mb.id as member_pk, mb.public_id as id, mb.type, mb.name, mu.start_date as joined_on
          from member_users mu join members mb on mb.id = mu.member_id
         where mu.user_id = $1 and mu.start_date <= $2 and (mu.end_date is null or mu.end_date >= $2)`,
       [user.id, today],
@@ -72,7 +74,7 @@ export class CustomerController {
           `select m.id, p.name as plan_name, p.monthly_hours, m.start_date, m.end_date
              from memberships m join plans p on p.id = m.plan_id
             where m.member_id = $1 order by m.start_date`,
-          [member.id],
+          [member.member_pk],
         )
       : [];
     const [v] = await R(
@@ -84,9 +86,9 @@ export class CustomerController {
       [user.id],
     );
     return {
-      user,
-      member: member ?? null,
-      wallets,
+      user: toPublicUser(user),
+      member: member ? { id: member.id, type: member.type, name: member.name, joined_on: member.joined_on } : null,
+      wallets: wallets.map(pubWallet),
       memberships,
       today, // 한국 기준 오늘 날짜
       free_pass_used: v.n > 0, // 첫 노쇼·늦은 취소 면제를 이미 썼는지 (계산한 값)
@@ -193,7 +195,7 @@ export class CustomerController {
     const mo = month && /^\d{4}-\d{2}$/.test(month) ? month : nowKST().date.slice(0, 7);
     const { start, end } = monthRange(mo);
     const rows = await query(
-      `select r.id, r.reserved_date, to_char(r.start_time,'HH24:MI') as start_time, to_char(r.end_time,'HH24:MI') as end_time,
+      `select r.public_id as id, r.reserved_date, to_char(r.start_time,'HH24:MI') as start_time, to_char(r.end_time,'HH24:MI') as end_time,
               r.meeting_room_id, mr.name as room_name, r.status, (r.user_id = $3) as mine
          from reservations r join meeting_rooms mr on mr.id = r.meeting_room_id
         where r.reserved_date between $1 and $2 and r.status <> 'cancelled'
@@ -230,7 +232,7 @@ export class CustomerController {
   @Get('reservations/mine')
   async myReservations(@CurrentUser() user: AuthUser) {
     return query(
-      `select r.id, r.reserved_date, to_char(r.start_time,'HH24:MI') as start_time, to_char(r.end_time,'HH24:MI') as end_time,
+      `select r.public_id as id, r.reserved_date, to_char(r.start_time,'HH24:MI') as start_time, to_char(r.end_time,'HH24:MI') as end_time,
               r.people_count, r.status, r.checked_in_at, r.cancelled_at, r.correction_reason,
               mr.id as meeting_room_id, mr.name as room_name,
               coalesce((select sum(minutes) from usage_records where reservation_id = r.id), 0)::int as charged_minutes
@@ -285,13 +287,20 @@ export class CustomerController {
       const [r] = await q(
         c,
         `insert into reservations (meeting_room_id, user_id, reserved_date, start_time, end_time, people_count)
-         values ($1,$2,$3,$4,$5,$6) returning id, reserved_date, start_time, end_time, people_count, status`,
+         values ($1,$2,$3,$4,$5,$6) returning id, public_id, reserved_date, start_time, end_time, people_count, status`,
         [roomId, user.id, date, start, end, people],
       );
       const alloc = await allocateUsage(c, r.id, user.id, date, minutesBetween(start, end));
       const overage = alloc.overage_minutes;
       return {
-        reservation: r,
+        reservation: {
+          id: r.public_id,
+          reserved_date: r.reserved_date,
+          start_time: r.start_time,
+          end_time: r.end_time,
+          people_count: r.people_count,
+          status: r.status,
+        },
         charged: alloc.parts,
         overage_minutes: overage,
         message: overage
@@ -306,15 +315,15 @@ export class CustomerController {
   @Patch('reservations/:id')
   async update(
     @CurrentUser() user: AuthUser,
-    @Param('id', ParseIntPipe) id: number,
+    @Param('id', uuidPipe()) publicId: string,
     @Body() body: { people_count?: number },
   ) {
     const people = Number(body.people_count);
     if (!Number.isInteger(people) || people < 1) throw new BadRequestException('참석 인원은 1명 이상이어야 해요.');
     const [r] = await query(
       `select r.*, mr.max_people, mr.name as room_name from reservations r join meeting_rooms mr on mr.id = r.meeting_room_id
-        where r.id = $1 and r.user_id = $2`,
-      [id, user.id],
+        where r.public_id = $1 and r.user_id = $2`,
+      [publicId, user.id],
     );
     if (!r) throw new NotFoundException('내 예약이 아니에요.');
     if (r.status !== 'reserved') throw new BadRequestException('예약 상태에서만 인원을 바꿀 수 있어요.');
@@ -322,14 +331,14 @@ export class CustomerController {
     if (people > r.max_people) {
       throw new BadRequestException(`${r.room_name}은(는) 최대 ${r.max_people}명까지 이용할 수 있어요.`);
     }
-    await query('update reservations set people_count = $2 where id = $1', [id, people]);
+    await query('update reservations set people_count = $2 where id = $1', [r.id, people]);
     return { ok: true, people_count: people };
   }
 
   // 취소: 시작 1시간 전까지는 무료, 그 뒤는 늦은 취소(첫 번째 0%, 이후 50% 차감)
   @Roles('customer')
   @Post('reservations/:id/cancel')
-  async cancel(@CurrentUser() user: AuthUser, @Param('id', ParseIntPipe) id: number) {
+  async cancel(@CurrentUser() user: AuthUser, @Param('id', uuidPipe()) publicId: string) {
     const now = nowKST().ts;
     return tx(async (c) => {
       const [r] = await q(
@@ -337,19 +346,19 @@ export class CustomerController {
         `select r.id, r.status,
                 ($2::timestamp >= (r.reserved_date + r.start_time)) as started,
                 ($2::timestamp > (r.reserved_date + r.start_time) - interval '1 hour') as late
-           from reservations r where r.id = $1 and r.user_id = $3 for update`,
-        [id, now, user.id],
+           from reservations r where r.public_id = $1 and r.user_id = $3 for update`,
+        [publicId, now, user.id],
       );
       if (!r) throw new NotFoundException('내 예약이 아니에요.');
       if (r.status !== 'reserved') throw new BadRequestException('이미 처리된 예약이에요.');
       if (r.started) throw new BadRequestException('이미 시작된 예약은 취소할 수 없어요.');
 
-      await q(c, `update reservations set status = 'cancelled', cancelled_at = now() where id = $1`, [id]);
+      await q(c, `update reservations set status = 'cancelled', cancelled_at = now() where id = $1`, [r.id]);
       if (!r.late) {
-        await releaseUsage(c, id);
+        await releaseUsage(c, r.id);
         return { late: false, message: '취소됐어요. 차감된 시간은 모두 돌려드렸어요.' };
       }
-      const p = await applyPenalty(c, id, user.id);
+      const p = await applyPenalty(c, r.id, user.id);
       return {
         late: true,
         percent: p.percent,

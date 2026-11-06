@@ -15,7 +15,8 @@ import { randomBytes } from 'crypto';
 import { AuthUser, CurrentUser, Roles } from './auth';
 import { q, query, tx } from './db';
 import { cycleFor, isYMD, monthRange, nowKST } from './dates';
-import { applyPenalty, billingFor, cancelFutureReservations, getWallets, releaseUsage, runner } from './core';
+import { applyPenalty, billingFor, cancelFutureReservations, getWallets, pubWallet, releaseUsage, runner } from './core';
+import { internalId, uuidPipe } from './ids';
 
 const tempPassword = () => `Tmp-${randomBytes(5).toString('hex')}`;
 
@@ -27,9 +28,9 @@ export class AdminController {
   reservations(@Query('date') date?: string) {
     const d = date && isYMD(date) ? date : nowKST().date;
     return query(
-      `select r.id, r.reserved_date, to_char(r.start_time,'HH24:MI') as start_time, to_char(r.end_time,'HH24:MI') as end_time,
+      `select r.public_id as id, r.reserved_date, to_char(r.start_time,'HH24:MI') as start_time, to_char(r.end_time,'HH24:MI') as end_time,
               r.people_count, r.status, r.checked_in_at, r.cancelled_at, r.correction_reason,
-              mr.name as room_name, u.id as user_id, u.name as user_name,
+              mr.name as room_name, u.public_id as user_id, u.name as user_name,
               (select mb.name from member_users mu join members mb on mb.id = mu.member_id
                 where mu.user_id = u.id and mu.start_date <= r.reserved_date
                   and (mu.end_date is null or mu.end_date >= r.reserved_date)) as member_name,
@@ -45,10 +46,10 @@ export class AdminController {
 
   // 사용 시작: 늦게 와도 인정하지만 끝나는 시각은 그대로다. (결정 9)
   @Post('reservations/:id/check-in')
-  async checkIn(@Param('id', ParseIntPipe) id: number) {
+  async checkIn(@Param('id', uuidPipe()) id: string) {
     const [r] = await query(
       `update reservations set checked_in_at = now()
-        where id = $1 and status = 'reserved' and checked_in_at is null
+        where public_id = $1 and status = 'reserved' and checked_in_at is null
         returning id, to_char(end_time,'HH24:MI') as end_time`,
       [id],
     );
@@ -57,10 +58,10 @@ export class AdminController {
   }
 
   @Post('reservations/:id/complete')
-  async complete(@Param('id', ParseIntPipe) id: number) {
+  async complete(@Param('id', uuidPipe()) id: string) {
     const [r] = await query(
       `update reservations set status = 'completed'
-        where id = $1 and status = 'reserved' and checked_in_at is not null returning id`,
+        where public_id = $1 and status = 'reserved' and checked_in_at is not null returning id`,
       [id],
     );
     if (!r) throw new BadRequestException('사용 시작을 누른 예약만 사용 완료로 바꿀 수 있어요.');
@@ -75,17 +76,29 @@ export class AdminController {
     return tx(async (c) => {
       const rows = await q(
         c,
-        `select id, user_id from reservations
-          where status = 'reserved' and checked_in_at is null
-            and (reserved_date + start_time) + interval '15 minutes' < $1::timestamp
-          order by reserved_date, start_time for update`,
+        `select r.id, r.public_id, r.user_id, r.reserved_date, to_char(r.start_time,'HH24:MI') as start_time,
+                mr.name as room_name, u.name as user_name
+           from reservations r
+           join meeting_rooms mr on mr.id = r.meeting_room_id
+           join users u on u.id = r.user_id
+          where r.status = 'reserved' and r.checked_in_at is null
+            and (r.reserved_date + r.start_time) + interval '15 minutes' < $1::timestamp
+          order by r.reserved_date, r.start_time for update of r`,
         [now],
       );
       const out: any[] = [];
       for (const r of rows) {
         await q(c, `update reservations set status = 'no_show' where id = $1`, [r.id]);
         const p = await applyPenalty(c, r.id, r.user_id);
-        out.push({ id: r.id, percent: p.percent, first_violation: p.first_violation });
+        out.push({
+          id: r.public_id,
+          reserved_date: r.reserved_date,
+          start_time: r.start_time,
+          room_name: r.room_name,
+          user_name: r.user_name,
+          percent: p.percent,
+          first_violation: p.first_violation,
+        });
       }
       return { now, changed: out.length, reservations: out };
     });
@@ -95,13 +108,13 @@ export class AdminController {
   @Post('reservations/:id/correct')
   async correct(
     @CurrentUser() staff: AuthUser,
-    @Param('id', ParseIntPipe) id: number,
+    @Param('id', uuidPipe()) id: string,
     @Body() body: { reason?: string },
   ) {
     const reason = String(body.reason ?? '').trim();
     if (!reason) throw new BadRequestException('정정 사유를 적어 주세요.');
     return tx(async (c) => {
-      const [r] = await q(c, 'select id, status, corrected_by from reservations where id = $1 for update', [id]);
+      const [r] = await q(c, 'select id, status, corrected_by from reservations where public_id = $1 for update', [id]);
       if (!r) throw new NotFoundException('없는 예약이에요.');
       if (r.corrected_by) throw new BadRequestException('이미 정정된 예약이에요.');
       if (!['no_show', 'cancelled'].includes(r.status)) {
@@ -111,9 +124,9 @@ export class AdminController {
         c,
         `update reservations set status = 'cancelled', cancelled_at = coalesce(cancelled_at, now()),
                 corrected_by = $2, correction_reason = $3 where id = $1`,
-        [id, staff.id, reason],
+        [r.id, staff.id, reason],
       );
-      await releaseUsage(c, id);
+      await releaseUsage(c, r.id);
       return { ok: true, message: '정정했어요. 차감된 시간을 돌려드렸고, 첫 면제 횟수에도 포함되지 않아요.' };
     });
   }
@@ -122,31 +135,30 @@ export class AdminController {
   @Get('members')
   async members() {
     const today = nowKST().date;
-    const members = await query('select id, type, name from members order by id');
+    const members = await query('select id as pk, public_id as id, type, name from members order by pk');
     const out: any[] = [];
     for (const m of members) {
       const users = await query(
-        `select u.id, u.name, u.email, mu.id as member_user_id, mu.start_date, mu.end_date
+        `select u.public_id as id, u.name, u.email, mu.id as member_user_id, mu.start_date, mu.end_date
            from member_users mu join users u on u.id = mu.user_id
           where mu.member_id = $1 and mu.start_date <= $2 and (mu.end_date is null or mu.end_date >= $2)
           order by u.name`,
-        [m.id, today],
+        [m.pk, today],
       );
       const [ms] = await query(
         `select ms.id, p.name as plan_name, ms.start_date, ms.end_date
            from memberships ms join plans p on p.id = ms.plan_id
           where ms.member_id = $1 and ms.end_date >= $2 order by ms.start_date limit 1`,
-        [m.id, today],
+        [m.pk, today],
       );
-      out.push({ ...m, users, membership: ms ?? null, billing: await billingFor(m.id, today) });
+      out.push({ id: m.id, type: m.type, name: m.name, users, membership: ms ?? null, billing: await billingFor(m.pk, today) });
     }
     return out;
   }
 
   @Get('billing')
   async billing(@Query('member_id') memberId: string, @Query('date') date?: string) {
-    const id = Number(memberId);
-    if (!id) throw new BadRequestException('멤버를 골라 주세요.');
+    const id = await internalId('members', memberId, '멤버를 골라 주세요.');
     const d = date && isYMD(date) ? date : nowKST().date;
     const b = await billingFor(id, d);
     if (!b) throw new NotFoundException('그 날짜에 이용 중인 멤버십이 없어요.');
@@ -157,7 +169,7 @@ export class AdminController {
   customers() {
     const today = nowKST().date;
     return query(
-      `select u.id, u.name, u.email, u.is_active,
+      `select u.public_id as id, u.name, u.email, u.is_active,
               (select mb.name from member_users mu join members mb on mb.id = mu.member_id
                 where mu.user_id = u.id and mu.start_date <= $1 and (mu.end_date is null or mu.end_date >= $1)) as member_name
          from users u where u.role = 'customer' order by u.id desc`,
@@ -169,31 +181,32 @@ export class AdminController {
   async createCompany(@Body() body: { name?: string }) {
     const name = String(body.name ?? '').trim();
     if (!name) throw new BadRequestException('회사 이름을 적어 주세요.');
-    const [m] = await query(`insert into members (type, name) values ('company', $1) returning id, type, name`, [name]);
+    const [m] = await query(`insert into members (type, name) values ('company', $1) returning public_id as id, type, name`, [name]);
     return m;
   }
 
   @Post('members/:id/membership')
   async addMembership(
-    @Param('id', ParseIntPipe) id: number,
+    @Param('id', uuidPipe()) publicId: string,
     @Body() body: { plan_id?: number; start_date?: string },
   ) {
     const planId = Number(body.plan_id);
     if (!planId) throw new BadRequestException('멤버십 종류를 골라 주세요.');
+    const memberId = await internalId('members', publicId, '없는 멤버예요.');
     const start = body.start_date && isYMD(body.start_date) ? body.start_date : nowKST().date;
     const end = cycleFor(start, start).end;
     const [row] = await query(
-      'insert into memberships (member_id, plan_id, start_date, end_date) values ($1,$2,$3,$4) returning *',
-      [id, planId, start, end],
+      'insert into memberships (member_id, plan_id, start_date, end_date) values ($1,$2,$3,$4) returning id, plan_id, start_date, end_date',
+      [memberId, planId, start, end],
     );
     return row;
   }
 
   // 고객을 회사 멤버에 소속시킨다. 기존 소속은 전날로 끝내고, 개인 멤버십의 남은 시간은 그 주기 끝까지 유지된다. (결정 19, 20)
   @Post('members/:id/users')
-  async addUser(@Param('id', ParseIntPipe) memberId: number, @Body() body: { user_id?: number; start_date?: string }) {
-    const userId = Number(body.user_id);
-    if (!userId) throw new BadRequestException('고객을 골라 주세요.');
+  async addUser(@Param('id', uuidPipe()) memberPublicId: string, @Body() body: { user_id?: string; start_date?: string }) {
+    const userId = await internalId('users', body.user_id, '고객을 골라 주세요.');
+    const memberId = await internalId('members', memberPublicId, '없는 멤버예요.');
     const start = body.start_date && isYMD(body.start_date) ? body.start_date : nowKST().date;
     return tx(async (c) => {
       const [u] = await q(c, `select id from users where id = $1 and role = 'customer'`, [userId]);
@@ -216,7 +229,7 @@ export class AdminController {
       }
       const [row] = await q(
         c,
-        'insert into member_users (user_id, member_id, start_date) values ($1,$2,$3) returning *',
+        'insert into member_users (user_id, member_id, start_date) values ($1,$2,$3) returning id, start_date, end_date',
         [userId, memberId, start],
       );
       return row;
@@ -290,7 +303,7 @@ export class AdminController {
     const mo = month && /^\d{4}-\d{2}$/.test(month) ? month : nowKST().date.slice(0, 7);
     const { start, end } = monthRange(mo);
     return query(
-      `select mb.id as member_id, mb.name as member_name, p.name as plan_name, m.end_date
+      `select mb.public_id as member_id, mb.name as member_name, p.name as plan_name, m.end_date
          from memberships m join members mb on mb.id = m.member_id join plans p on p.id = m.plan_id
         where m.end_date between $1 and $2
           and not exists (select 1 from memberships n where n.member_id = m.member_id and n.start_date > m.end_date)
@@ -337,15 +350,14 @@ export class AdminController {
   @Post('seats/:id/assign')
   async assignSeat(
     @Param('id', ParseIntPipe) id: number,
-    @Body() body: { member_id?: number; start_date?: string; end_date?: string | null },
+    @Body() body: { member_id?: string; start_date?: string; end_date?: string | null },
   ) {
-    const memberId = Number(body.member_id);
-    if (!memberId) throw new BadRequestException('멤버를 골라 주세요.');
+    const memberId = await internalId('members', body.member_id, '멤버를 골라 주세요.');
     if (!isYMD(body.start_date)) throw new BadRequestException('시작일을 확인해 주세요.');
     const end = body.end_date ? (isYMD(body.end_date) ? body.end_date : null) : null;
     if (body.end_date && !end) throw new BadRequestException('종료일을 확인해 주세요.');
     const [row] = await query(
-      'insert into seat_assignments (seat_id, member_id, start_date, end_date) values ($1,$2,$3,$4) returning *',
+      'insert into seat_assignments (seat_id, member_id, start_date, end_date) values ($1,$2,$3,$4) returning id, seat_id, start_date, end_date',
       [id, memberId, body.start_date, end],
     );
     return row;
@@ -356,8 +368,8 @@ export class AdminController {
   @Get('staff')
   staffList() {
     return query(
-      `select id, email, name, role, is_active, must_change_password, created_at
-         from users where role in ('staff','admin') order by id`,
+      `select u.public_id as id, u.email, u.name, u.role, u.is_active, u.must_change_password, u.created_at
+         from users u where u.role in ('staff','admin') order by u.id`,
     );
   }
 
@@ -372,7 +384,7 @@ export class AdminController {
     const temp = tempPassword();
     const [u] = await query(
       `insert into users (email, password_hash, name, role, must_change_password) values ($1,$2,$3,$4,true)
-       returning id, email, name, role, is_active`,
+       returning public_id as id, email, name, role, is_active`,
       [email, await bcrypt.hash(temp, 10), name, role],
     );
     return { user: u, temp_password: temp, message: '임시 비밀번호는 지금만 보여요. 직원에게 전달해 주세요.' };
@@ -382,21 +394,21 @@ export class AdminController {
   @Patch('staff/:id')
   async updateStaff(
     @CurrentUser() me: AuthUser,
-    @Param('id', ParseIntPipe) id: number,
+    @Param('id', uuidPipe()) id: string,
     @Body() body: { name?: string; role?: string; is_active?: boolean },
   ) {
-    const [u] = await query(`select * from users where id = $1 and role in ('staff','admin')`, [id]);
+    const [u] = await query(`select * from users where public_id = $1 and role in ('staff','admin')`, [id]);
     if (!u) throw new NotFoundException('없는 직원이에요.');
     const name = body.name !== undefined ? String(body.name).trim() : u.name;
     const role = body.role === undefined ? u.role : body.role === 'admin' ? 'admin' : 'staff';
     const active = body.is_active === undefined ? u.is_active : !!body.is_active;
     if (!name) throw new BadRequestException('이름을 적어 주세요.');
-    if (id === me.id && (!active || role !== u.role)) {
+    if (u.id === me.id && (!active || role !== u.role)) {
       throw new BadRequestException('본인 계정의 역할을 바꾸거나 사용을 중지할 수는 없어요.');
     }
     const [row] = await query(
-      `update users set name = $2, role = $3, is_active = $4 where id = $1 returning id, email, name, role, is_active`,
-      [id, name, role, active],
+      `update users set name = $2, role = $3, is_active = $4 where id = $1 returning public_id as id, email, name, role, is_active`,
+      [u.id, name, role, active],
     );
     return row;
   }
@@ -404,11 +416,11 @@ export class AdminController {
   // 비밀번호 리셋: 임시 비밀번호가 나오고, 직원은 다음 로그인 때 새 비밀번호로 바꿔야 한다.
   @Roles('admin')
   @Post('staff/:id/reset-password')
-  async resetPassword(@Param('id', ParseIntPipe) id: number) {
+  async resetPassword(@Param('id', uuidPipe()) id: string) {
     const temp = tempPassword();
     const [u] = await query(
       `update users set password_hash = $2, must_change_password = true
-        where id = $1 and role in ('staff','admin') returning id, email, name`,
+        where public_id = $1 and role in ('staff','admin') returning public_id as id, email, name`,
       [id, await bcrypt.hash(temp, 10)],
     );
     if (!u) throw new NotFoundException('없는 직원이에요.');
@@ -417,7 +429,8 @@ export class AdminController {
 
   // 관리자 화면용: 지금 쓸 수 있는 시간(고객 대리 조회)
   @Get('customers/:id/wallets')
-  customerWallets(@Param('id', ParseIntPipe) id: number) {
-    return getWallets(id, nowKST().date);
+  async customerWallets(@Param('id', uuidPipe()) id: string) {
+    const userId = await internalId('users', id, '없는 고객이에요.');
+    return (await getWallets(userId, nowKST().date)).map(pubWallet);
   }
 }

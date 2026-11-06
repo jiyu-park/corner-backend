@@ -7,13 +7,20 @@ create extension if not exists btree_gist;
 
 set search_path = hw2, public;
 
+-- 역할은 enum 타입: 정해진 값 말고는 DB가 타입 단계에서 거절한다.
+create type user_role as enum ('customer', 'staff', 'admin');
+
+-- 밖(화면, API, 로그인 토큰)에는 연번 id 대신 public_id(무작위 UUID)만 내보낸다.
+-- id(연번)는 DB 안에서 표를 잇는 데만 쓴다. (users, members, reservations)
+
 -- 1. 사용자: 로그인하는 사람 (고객=예약 담당자, 직원, 관리자)
 create table users (
   id                   serial primary key,
+  public_id            uuid        not null unique default gen_random_uuid(),
   email                text        not null,
   password_hash        text        not null,
   name                 text        not null,
-  role                 text        not null check (role in ('customer', 'staff', 'admin')),
+  role                 user_role   not null,
   is_active            boolean     not null default true,
   must_change_password boolean     not null default false,
   created_at           timestamptz not null default now()
@@ -24,6 +31,7 @@ create unique index users_email_unique on users (lower(email));
 -- 2. 멤버: 개인 또는 회사
 create table members (
   id         serial primary key,
+  public_id  uuid        not null unique default gen_random_uuid(),
   type       text        not null check (type in ('individual', 'company')),
   name       text        not null,
   created_at timestamptz not null default now()
@@ -97,6 +105,7 @@ create table seat_assignments (
 -- 8. 예약
 create table reservations (
   id                serial primary key,
+  public_id         uuid    not null unique default gen_random_uuid(),
   meeting_room_id   integer not null references meeting_rooms (id),
   user_id           integer not null references users (id),
   reserved_date     date    not null,
