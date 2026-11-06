@@ -15,8 +15,12 @@ function daysInMonth(y: number, m: number) {
   return new Date(Date.UTC(y, m, 0)).getUTCDate();
 }
 
+// 형식이 맞아도 2월 30일처럼 없는 날짜는 거른다. (Date.parse는 다음 달로 넘겨서 받아 주기 때문)
 export function isYMD(s: unknown): s is string {
-  return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(Date.parse(s));
+  if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const { y, m, d } = parseYMD(s);
+  const t = new Date(Date.UTC(y, m - 1, d));
+  return t.getUTCFullYear() === y && t.getUTCMonth() === m - 1 && t.getUTCDate() === d;
 }
 
 export function isHM(s: unknown): s is string {
