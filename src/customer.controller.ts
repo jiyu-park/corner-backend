@@ -88,6 +88,7 @@ export class CustomerController {
       member: member ?? null,
       wallets,
       memberships,
+      today, // 한국 기준 오늘 날짜
       free_pass_used: v.n > 0, // 첫 노쇼·늦은 취소 면제를 이미 썼는지 (계산한 값)
       overage_per_hour: OVERAGE_PER_HOUR,
     };
@@ -199,7 +200,7 @@ export class CustomerController {
         order by r.reserved_date, r.start_time`,
       [start, end, user.id],
     );
-    return { month: mo, reservations: rows };
+    return { month: mo, today: nowKST().date, reservations: rows }; // today는 한국 기준 오늘(해외에서 접속해도 같은 기준)
   }
 
   // 예약 전 미리 보기: 차감 시간, 남는 시간, 한도를 넘을 때의 청구 금액. 저장하지 않는다.
